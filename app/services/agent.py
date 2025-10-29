@@ -1710,13 +1710,13 @@ def _extract_image_urls(item: Dict[str, Any]) -> List[str]:
     
     return out
 
-
-def _download_images_to_temp(urls: List[str]) -> Tuple[str, List[str]]:
+def _download_images_to_temp(urls: List[str], max_images: int = 2) -> Tuple[str, List[str]]:
     """
-    Robust image downloader (up to 9):
+    Robust image downloader (capped):
+      - Downloads at most `max_images` (hard-capped to 2).
       - Per-host headers (Referer, Accept-Language, realistic UA)
       - Fallback ext via Content-Type
-      - Retry on 401/403 with generic referer
+      - Retry HEAD quirks
       - Max size guard (MAX_IMG_MB, default 8)
     Returns: (tmpdir, [abs file paths])
     """
@@ -1724,26 +1724,24 @@ def _download_images_to_temp(urls: List[str]) -> Tuple[str, List[str]]:
     import mimetypes
     import tempfile
     from urllib.parse import urlparse
-    print(urls)
-    tmpdir = tempfile.mkdtemp(prefix="listing_imgs_")
-    print("Downloading images to", tmpdir)
-    saved: List[str] = []
 
-    sess = _session_with_retries()  # your existing session (has .request_timeout)
-
-    MAX_IMAGES = 9
+    # ✅ Hard cap to 2 (requirement)
+    MAX_IMAGES = min(int(max_images) if isinstance(max_images, int) and max_images > 0 else 2, 2)
     DEFAULT_EXT = ".jpg"
     ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
     MAX_IMG_MB = float(os.getenv("MAX_IMG_MB", "8"))
     MAX_BYTES = int(MAX_IMG_MB * 1024 * 1024)
 
-    # You can override globally if needed
-    GLOBAL_REFERER = (os.getenv("IMG_FETCH_REFERER") or "").strip() or None
+    tmpdir = tempfile.mkdtemp(prefix="listing_imgs_")
+    saved: List[str] = []
+
+    sess = _session_with_retries()  # has .request_timeout set
+
     UA = (os.getenv("IMG_FETCH_UA") or "").strip() or \
-         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "\
-         "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
     ACCEPT_LANG = (os.getenv("IMG_FETCH_ACCEPT_LANGUAGE") or "").strip() or \
                   "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7"
+    GLOBAL_REFERER = (os.getenv("IMG_FETCH_REFERER") or "").strip() or None
 
     def _pick_ext(url_path: str, resp_ct: str) -> str:
         ext = os.path.splitext(url_path)[1].lower()
@@ -1786,13 +1784,12 @@ def _download_images_to_temp(urls: List[str]) -> Tuple[str, List[str]]:
         return h
 
     for i, url in enumerate(urls[:MAX_IMAGES], start=1):
-        # sanity
         if not (isinstance(url, str) and (url.startswith("http://") or url.startswith("https://"))):
             dbg("image_download_failed", {"url": url, "err": "invalid_url"})
             continue
 
         try:
-            # some CDNs block HEAD; ignore failures
+            # Some CDNs dislike HEAD; ignore failures
             try:
                 sess.head(url, timeout=sess.request_timeout, headers={"User-Agent": UA})
             except Exception:
@@ -1802,7 +1799,7 @@ def _download_images_to_temp(urls: List[str]) -> Tuple[str, List[str]]:
             r = sess.get(url, timeout=sess.request_timeout, stream=True, headers=headers, allow_redirects=True)
             status = r.status_code
 
-            # If 401/403, retry once with generic referer (unless a global referer is already set)
+            # Retry once with generic referer on 401/403 (if no global referer)
             if status in (401, 403) and not GLOBAL_REFERER:
                 try:
                     r.close()
@@ -1845,7 +1842,6 @@ def _download_images_to_temp(urls: List[str]) -> Tuple[str, List[str]]:
             dbg("image_download_failed", {"url": url, "err": str(e)})
 
     return tmpdir, saved
-
 
 def _maybe_upload_files(filepaths: List[str]) -> List[str]:
     """
