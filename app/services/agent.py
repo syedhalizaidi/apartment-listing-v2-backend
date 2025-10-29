@@ -1953,7 +1953,7 @@ def send_listing_images_if_any(user_id: str, listing: Dict[str, Any]) -> None:
             return u
 
         # FAST PATH: Send originals directly (use if processing fails often)
-        if os.getenv("SEND_ORIGINAL_IMAGE_URLS", "0").lower() in ("1","true","yes"):
+        if os.getenv("SEND_ORIGINAL_IMAGE_URLS", "9").lower() in ("1","true","yes"):
             sess = ensure_session(user_id)
             to_number = (
                 _normalize_wa_number(user_id)
@@ -1962,7 +1962,7 @@ def send_listing_images_if_any(user_id: str, listing: Dict[str, Any]) -> None:
             )
             if not to_number:
                 dbg("no_recipient_number", {"user_id": user_id}); return
-            fast_urls = [_https(u) for u in urls[:int(os.getenv("MAX_MEDIA_PER_SEND","9"))]]
+            fast_urls = [_https(u) for u in urls[:int(os.getenv("MAX_MEDIA_PER_SEND","2"))]]
             dbg("media_urls_fastpath", fast_urls)
             _twilio_send_whatsapp_media(fast_urls, to_number)
             return
@@ -2049,7 +2049,7 @@ def send_listing_images_if_any(user_id: str, listing: Dict[str, Any]) -> None:
         # If still no files, fallback to originals
         if not files:
             dbg("image_download_unavailable_after_retries_fallback_to_originals", {"original_urls": [u[:50] + "..." for u in urls[:2]]})
-            media_to_send = [_https(u) for u in urls[:int(os.getenv("MAX_MEDIA_PER_SEND","9"))]]
+            media_to_send = [_https(u) for u in urls[:int(os.getenv("MAX_MEDIA_PER_SEND","2"))]]
         else:
             # Process files
             files = _lightly_process_images(files)
@@ -2061,12 +2061,12 @@ def send_listing_images_if_any(user_id: str, listing: Dict[str, Any]) -> None:
             media_to_send = _publish_locally(files)
             if not media_to_send:
                 dbg("local_publish_failed_all_fallback_to_originals", "FALLBACK_TO_ORIGINAL_URLS")
-                media_to_send = [_https(u) for u in urls[:int(os.getenv("MAX_MEDIA_PER_SEND","9"))]]
+                media_to_send = [_https(u) for u in urls[:int(os.getenv("MAX_MEDIA_PER_SEND","2"))]]
 
         dbg("media_urls_final", media_to_send[:2])  # First 2 for debug
 
         # Probe only for self-hosted
-        if (os.getenv("MEDIA_PROBE_BEFORE_SEND", "0").lower() in ("1","true","yes") and 
+        if (os.getenv("MEDIA_PROBE_BEFORE_SEND", "2").lower() in ("1","true","yes") and 
             all("static/wa-media" in u for u in media_to_send)):  # Adjust for your server
             _wait_until_public(media_to_send)
 
