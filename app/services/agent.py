@@ -182,6 +182,8 @@ def _lightly_process_images(filepaths: List[str]) -> List[str]:
     return processed
 import base64  # at top if not present
 import threading, time, uuid, errno
+import ast
+from urllib.parse import urlparse
 
 def _ensure_dir(path: str) -> Optional[str]:
     """Try to mkdir, return usable path or None."""
@@ -602,6 +604,7 @@ CITY_ALIASES = {
     "fukuoka": ["fukuoka", "福岡", "ふくおか"],
     "nagoya": ["nagoya", "名古屋", "なごや"],
     "yokohama": ["yokohama", "横浜", "よこはま"],
+    "chiba": ["chiba", "千葉", "ちば", "chibashi", "chiba-shi"],
 }
 # Normalize any phone into Twilio WhatsApp format
 def _normalize_wa_number(raw: Optional[str]) -> Optional[str]:
@@ -829,13 +832,13 @@ def _search_once(store: ListingStore, variants: List[str]) -> List[Dict[str, Any
     for q in variants:
         dbg("Search query", q)
         # pass-through where filters later at caller; here focus on recall
-        cands = store.search(q, n=80) or []
+        cands = store.search(q, n=200) or []
         dbg("Candidates found", len(cands))
         for c in cands:
             key = c.get("id") or c.get("url") or c.get("details_url") or c.get("source") or c.get("document") or str(c)[:200]
             if key not in seen_ids:
                 seen_ids.add(key); all_candidates.append(c)
-        if len(all_candidates) >= 180:
+        if len(all_candidates) >= 400:
             break
     dbg("Merged candidates total", len(all_candidates))
     # deterministic ordering by score desc then id/url asc
@@ -945,7 +948,7 @@ def search_and_clean(user_id: str, query: str, prefs: Dict[str, Any], settings: 
     # use where filters to push down numeric filtering
     all_candidates = []
     for qv in variants:
-        cs = store.search(qv, n=100, where=prefs) or []  # Increased n for more results on corrections
+        cs = store.search(qv, n=200, where=prefs) or []  # Increased n for more results on corrections
         all_candidates.extend(cs)
     # dedup
     seen = set(); merged=[]
@@ -1659,56 +1662,52 @@ def _looks_like_selection(s: str, list_len: int) -> bool:
         got_any = True
     return got_any
 
-from urllib.parse import urlparse  # put at top of file
 def _extract_image_urls(item: Dict[str, Any]) -> List[str]:
     """Collect plausible image URLs; skip obvious UI icons/sprites."""
+    possible_keys = ["image", "image_url", "image_urls", "images", "photos", "thumbnails"]
     urls = []
-    
-    # Handle the 'images' field which is a string representation of a list
-    if "images" in item and isinstance(item["images"], str):
-        import ast
-        try:
-            # Try to safely evaluate the string as a Python literal
-            images_list = ast.literal_eval(item["images"])
-            if isinstance(images_list, list):
-                urls = [img for img in images_list if isinstance(img, str) and img.startswith(('http://', 'https://'))]
-                dbg("parsed_images_list", {
-                    "count": len(urls),
-                    "sample": urls[0][:100] + "..." if urls else "None"
-                })
-        except (ValueError, SyntaxError) as e:
-            # If evaluation fails, fall back to regex
+    for key in possible_keys:
+        val = item.get(key)
+        if val is None:
+            continue
+        if isinstance(val, str):
+            try:
+                parsed = ast.literal_eval(val)
+                if isinstance(parsed, list):
+                    val = parsed
+            except:
+                pass
+        if isinstance(val, list):
+            urls.extend([u for u in val if isinstance(u, str) and (u.startswith('http://') or u.startswith('https://'))])
+        elif isinstance(val, str):
+            # regex for urls in string
             import re
-            img_urls = re.findall(r'https?://[^\s\']+', item["images"])
-            if img_urls:
-                urls = img_urls
-                dbg("fallback_regex_extraction", {
-                    "count": len(urls),
-                    "sample": urls[0][:100] + "..." if urls else "None"
-                })
-    
+            found = re.findall(r'https?://[^\s\']+', val)
+            urls.extend(found)
+
     # Clean and validate URLs
     out = []
     seen = set()
     for url in urls:
         if not isinstance(url, str) or len(url) < 10:
             continue
-            
-        url = url.strip("'\"")
-        if not any(ext in url.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
+        url = url.strip("'\" ")
+        if not any(ext in url.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.avif']):
             continue
-            
+        parsed_url = urlparse(url)
+        if not parsed_url.scheme or not parsed_url.netloc:
+            continue
         if url not in seen:
             seen.add(url)
             out.append(url)
-    
+
     dbg("final_extracted_urls", {
         "item_title": item.get("title") or item.get("name") or "unknown",
         "found_urls": len(out),
         "sample_urls": out[:3] if out else []
     })
     
-    return out
+    return out[:10]
 
 
 def _download_images_to_temp(urls: List[str]) -> Tuple[str, List[str]]:
