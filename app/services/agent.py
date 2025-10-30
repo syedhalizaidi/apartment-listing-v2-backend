@@ -66,56 +66,8 @@ def _session_with_retries() -> requests.Session:
 
 @dataclass
 class BotPrompts:
-    greeting: str = (
-        "Hello! I'm your apartment hunting assistant. Let's find your perfect place!\n\n"
-        "I need a bit more info to make sure I find great options:\n"
-        "1) What's your expected move date?\n"
-        "2) Will anyone else be moving in with you?\n"
-        "3) What area are you looking to move to?\n"
-        "4) Any apartment or amenity requirements?\n"
-        "5) Any location vibe requirements (close to parks, restaurants, residential vs downtown, etc.)?"
-    )
-    clarify: str = (
-        "I need a little more info to find good matches. Can you tell me:\n"
-        "- Which area or station do you want?\n"
-        "- Your max monthly budget (JPY)?\n"
-        "- How many bedrooms do you need?\n"
-        "You can reply in one line or answer each bullet."
-    )
-    thanks_time_saved: str = (
-        "Nice — I’ve noted {time}.\n"
-        "Please share your *name*, *email*, and *phone* so I can coordinate and confirm."
-    )
-    selection_time_prompt: str = (
-        "Great choice! What time works for you?\n\n"
-        "Here are the options you picked:\n\n{summary}\n\n"
-        "(You can reply with a time like '10:30am', '14:00', 'tonight', or a range like '3–9 at night'.)"
-    )
-    contact_missing_any: str = (
-        "Thanks! I need your *name*, *email*, and *phone* to proceed (e.g., John Doe, john@acme.com, 2125550123)."
-    )
-    contact_missing_email: str = "Got your details. Could you share your *email* too?"
-    contact_missing_phone: str = "Thanks! And your *phone* number?"
-    contact_missing_name: str = "Thanks! And what's your *full name*?"
+    # Minimal fallbacks; most now AI-handled
     contact_saved: str = "Perfect — I’ve saved your contact details."
-    selection_help: str = "Which options should I reach out to? (Reply with numbers like: 1 and 3.)"
-    no_results: str = (
-        "Sorry — I couldn't find listings for that area right now.\n"
-        "I also retried with Japanese keywords but found no matches.\n"
-        "Want me to try nearby neighborhoods or adjust budget/bedrooms?"
-    )
-    short_results_prefix: str = (
-        "Here are a few options based on what you shared. For tighter matches, tell me:\n"
-        "- Nearest station or exact neighborhood\n"
-        "- Absolute max monthly budget (JPY)\n"
-        "- Bedrooms and pet preferences\n\n"
-    )
-    results_prefix: str = (
-        "Here are the best matches I found. Reply with the numbers of any options you like (e.g., '1 and 3').\n\n"
-    )
-    fallback_reply: str = (
-        "I can help you search rentals. Want me to look for listings now?"
-    )
     final_confirmation: str = (
         "All set! I’ve noted your interest in:\n{summary}\n\n"
         "Requested time: {time}\n"
@@ -376,8 +328,12 @@ def _ai_edit_images_if_allowed(filepaths: List[str]) -> List[str]:
 @dataclass
 class BotSettings:
     system_commands: List[str] = field(default_factory=lambda: [
-        "Stay friendly and concise. If the user asks about topics unrelated to rental apartments, "
-        "politely explain you only assist with apartment hunting and steer them back to rentals."
+        "You are Kaebo’s AI assistant for apartment hunting. All interactions must be conversational, not scripted. "
+        "The user should feel like they are chatting with their very close friend who is also a very successful real estate agent. "
+        "Perfect mix of casual, friendly, and professional. Respond in the user's language. "
+        "Stay on-topic: apartment hunting in Japan only. If off-topic, politely steer back. "
+        "Be concise, natural, and engaging. For greetings, warmly introduce yourself and ask key questions conversationally. "
+        "If no apartments in requested area (e.g., outside Japan), apologize and suggest Japan options."
     ])
     prompts: BotPrompts = field(default_factory=BotPrompts)
     model: str = "gpt-4o-mini"
@@ -572,12 +528,7 @@ def route_intent_with_llm(user_id: str, message: str, settings: BotSettings) -> 
 
 
 def compose_reply_with_llm(user_id: str, brief: Dict[str, Any], settings: BotSettings) -> str:
-    system = [
-        "You are a helpful, concise WhatsApp assistant. "
-        "Given a small JSON brief of the situation, produce a short, clear message. "
-        "Be conversational and natural. Stay on the apartment-hunting topic: "
-        "if the user asks about a different industry or topic, politely decline and say you are for apartment hunting only."
-    ] + (settings.system_commands or [])
+    system = settings.system_commands  # Use full system for tone
     # enrich brief with session snapshot for model-driven behavior
     sess = ensure_session(user_id)
     brief = dict(brief)
@@ -594,7 +545,7 @@ def compose_reply_with_llm(user_id: str, brief: Dict[str, Any], settings: BotSet
         system,
         {"brief": brief},
         model=settings.model,
-        extra_system='Return only JSON with {"text":"..."}.',
+        extra_system='Return only JSON with {"text":"..."}. Keep it conversational and natural.',
         history_window=settings.history_window,
         temperature=settings.temperature,
         top_p=settings.top_p,
@@ -604,7 +555,7 @@ def compose_reply_with_llm(user_id: str, brief: Dict[str, Any], settings: BotSet
     if isinstance(result, dict):
         text = result.get("text") or ""
     if not text:
-        return brief.get("fallback", "Got it.")
+        return brief.get("fallback", "Got it — let's keep hunting for your perfect spot!")
     return text
 
 
@@ -918,16 +869,36 @@ def _area_tokens(areas: List[str]) -> List[str]:
 def _matches_area(item: Dict[str, Any], area_tokens: List[str]) -> bool:
     if not area_tokens:
         return True
-    loc = f"{item.get('neighborhood','')}{item.get('city','')}".lower().replace(" ", "")
-    if any(tok in loc for tok in area_tokens):
-        return True
-    doc = (item.get("document") or item.get("text") or "").lower().replace(" ", "")
-    if doc and any(tok in doc for tok in area_tokens):
-        return True
+    
+    # Get location fields and normalize
+    location_fields = [
+        item.get('neighborhood', '').lower().replace(" ", "").replace("-", ""),
+        item.get('city', '').lower().replace(" ", "").replace("-", ""),
+        item.get('prefecture', '').lower().replace(" ", "").replace("-", "")
+    ]
+    
+    # Check each token against each location field
+    for tok in area_tokens:
+        # Remove common suffixes like -shi, -ku, -machi for more flexible matching
+        clean_tok = re.sub(r'-(shi|ku|machi|cho|mura)$', '', tok.lower().replace(" ", ""))
+        for loc in location_fields:
+            if clean_tok in loc or loc in clean_tok:
+                return True
+    
+    # Also check in document text if available
+    doc = (item.get("document") or item.get("text") or "").lower().replace(" ", "").replace("-", "")
+    if doc:
+        for tok in area_tokens:
+            clean_tok = re.sub(r'-(shi|ku|machi|cho|mura)$', '', tok.lower().replace(" ", ""))
+            if clean_tok in doc:
+                return True
+                
     return False
 
 
 # ===== Search pipeline =====
+NON_JAPAN_LOCATIONS = ["china", "usa", "us", "europe", "london", "new york", "paris"]  # Expand as needed
+
 def search_and_clean(user_id: str, query: str, prefs: Dict[str, Any], settings: BotSettings, min_count: int = 3) -> Dict[str, Any]:
     store = ListingStore(collection=SEARCH_COLLECTION)
     dbg("Vector index/ns", {"index": getattr(store, "index_name", "unknown"), "ns": getattr(store, "namespace", "")})
@@ -963,10 +934,18 @@ def search_and_clean(user_id: str, query: str, prefs: Dict[str, Any], settings: 
     if cache_key in cache:
         dbg("search_cache_hit", {"vars": key_variants})
         return cache[cache_key]
+
+    # Check for non-Japan locations
+    areas_in = [a for a in (prefs.get("areas") or []) if isinstance(a, str) and a.strip()]
+    query_lower = query.lower()
+    if any(loc in query_lower or any(loc in a.lower() for a in areas_in) for loc in NON_JAPAN_LOCATIONS):
+        dbg("Non-Japan location detected", {"query": query, "areas": areas_in})
+        return {"candidates": [], "filtered": [], "cleaned": [], "final": [], "unavailable": True, "reason": "non_japan"}
+
     # use where filters to push down numeric filtering
     all_candidates = []
     for qv in variants:
-        cs = store.search(qv, n=80, where=prefs) or []
+        cs = store.search(qv, n=100, where=prefs) or []  # Increased n for more results on corrections
         all_candidates.extend(cs)
     # dedup
     seen = set(); merged=[]
@@ -976,7 +955,6 @@ def search_and_clean(user_id: str, query: str, prefs: Dict[str, Any], settings: 
         seen.add(key); merged.append(c)
     all_candidates = merged
 
-    areas_in = [a for a in (prefs.get("areas") or []) if isinstance(a, str) and a.strip()]
     area_tokens = _area_tokens([a.lower() for a in areas_in])
 
     if areas_in:
@@ -1032,8 +1010,8 @@ def search_and_clean(user_id: str, query: str, prefs: Dict[str, Any], settings: 
     filtered = filter_results(base_pool, prefs)
     dbg("Filtered count", len(filtered))
 
-    top_for_clean = filtered[:12] if filtered else base_pool[:12]
-    cleaned = clean_results_with_llm(user_id, " / ".join(variants[:2]), prefs, top_for_clean, settings)[:12]
+    top_for_clean = filtered[:15] if filtered else base_pool[:15]  # Increased for more results
+    cleaned = clean_results_with_llm(user_id, " / ".join(variants[:2]), prefs, top_for_clean, settings)[:15]
     # ✅ Backfill any missing image fields from the originals
     cleaned = _backfill_media_from_hits(cleaned, top_for_clean)
 
@@ -1041,8 +1019,8 @@ def search_and_clean(user_id: str, query: str, prefs: Dict[str, Any], settings: 
 
     results: List[Dict[str, Any]] = cleaned
 
-    # Aim for a deterministic target count: prefer filtered size up to 12; otherwise base_pool size up to 12
-    target_count = min(12, len(filtered) if filtered else len(base_pool))
+    # Aim for a deterministic target count: prefer filtered size up to 15; otherwise base_pool size up to 15
+    target_count = min(15, len(filtered) if filtered else len(base_pool))
 
     if len(results) < target_count:
         def keyf(x): return (x.get("id"), x.get("url"), x.get("details_url"), x.get("title"))
@@ -1055,7 +1033,7 @@ def search_and_clean(user_id: str, query: str, prefs: Dict[str, Any], settings: 
                 break
 
     if len(results) < target_count:
-        coerced = coerce_candidates_to_listings(base_pool, want=max(target_count, 12))
+        coerced = coerce_candidates_to_listings(base_pool, want=max(target_count, 15))
         def keyf2(x): return (x.get("id"), x.get("url"), x.get("details_url"), x.get("title"))
         have = {keyf2(x) for x in results}
         for it in coerced:
@@ -1069,7 +1047,7 @@ def search_and_clean(user_id: str, query: str, prefs: Dict[str, Any], settings: 
         "candidates": base_pool,
         "filtered": filtered,
         "cleaned": cleaned,
-        "final": results[:target_count] or results[:12],
+        "final": results[:target_count] or results[:15],
         "unavailable": False
     }
     # store in cache
@@ -1183,7 +1161,7 @@ def clean_results_with_llm(user_id: str, query: str, prefs: Dict[str, Any], hits
             "4) Remove nulls and unknowns rather than writing placeholders.\n"
             "5) Preserve any image fields if present under the provided keys; coerce single strings to arrays when sensible.\n"
             "6) If a human-readable summary exists in listing text, set 'description' to a clean, single-line summary (140–220 chars, no newlines, no URLs).\n"
-            "7) Return a JSON object with {\"results\": [ ... up to 12 cleaned items ... ]}."
+            "7) Return a JSON object with {\"results\": [ ... up to 15 cleaned items ... ]}."
         )
 
     }
@@ -1196,9 +1174,9 @@ def clean_results_with_llm(user_id: str, query: str, prefs: Dict[str, Any], hits
         history_window=settings.history_window
     )
 
-    out = hits[:12]
+    out = hits[:15]
     if isinstance(result, dict) and "results" in result and isinstance(result["results"], list):
-        out = result["results"][:12]
+        out = result["results"][:15]
     return out
 
 
@@ -1453,7 +1431,12 @@ def handle_message(user_id: str, message: str, settings: Optional[BotSettings] =
             sess["appt_time"] = t_strong
             sess["awaiting_contact"] = True
             session_store.set(user_id, sess)
-            reply = settings.prompts.thanks_time_saved.format(time=t_strong)
+            brief = {
+                "situation": "time_captured",
+                "time": t_strong,
+                "fallback": "Awesome, got your time slot. Now, to make this happen, mind sharing your name, email, and phone?"
+            }
+            reply = compose_reply_with_llm(user_id, brief, settings)
             sess["history"].append({"role": "assistant", "content": reply})
             session_store.set(user_id, sess)
             return (reply, [])
@@ -1487,11 +1470,16 @@ def handle_message(user_id: str, message: str, settings: Optional[BotSettings] =
         session_store.set(user_id, sess)
         dbg("Prefs merged", merged)
 
-    # 4) Greetings
+    # 4) Greetings / Initial
     if intent == "greeting" or (not sess.get('has_initialized', False) and is_greeting(message)):
         sess['has_initialized'] = True
         session_store.set(user_id, sess)
-        reply = settings.prompts.greeting
+        brief = {
+            "situation": "greeting",
+            "prefs": sess.get("prefs", {}),
+            "fallback": "Hey! I'm your go-to buddy for snagging the perfect apartment. What's the move-in date you're eyeing? Anyone joining you? Neighborhood vibes? Budget? Amenities? Spill the details!"
+        }
+        reply = compose_reply_with_llm(user_id, brief, settings)
         sess["history"].append({"role": "assistant", "content": reply})
         session_store.set(user_id, sess)
         return (reply, [])
@@ -1504,7 +1492,12 @@ def handle_message(user_id: str, message: str, settings: Optional[BotSettings] =
             sess["appt_time"] = t_strong
             sess["awaiting_contact"] = True
             session_store.set(user_id, sess)
-            reply = settings.prompts.thanks_time_saved.format(time=t_strong)
+            brief = {
+                "situation": "time_captured",
+                "time": t_strong,
+                "fallback": "Sweet, {time} it is. Quick—your name, email, phone so I can lock this down?"
+            }
+            reply = compose_reply_with_llm(user_id, {"situation": "time_captured", "time": t_strong}, settings)
             sess["history"].append({"role": "assistant", "content": reply})
             session_store.set(user_id, sess)
             return (reply, [])
@@ -1526,7 +1519,12 @@ def handle_message(user_id: str, message: str, settings: Optional[BotSettings] =
                 sess["appt_time"] = maybe_time
                 sess["awaiting_contact"] = True
                 session_store.set(user_id, sess)
-                reply = settings.prompts.thanks_time_saved.format(time=maybe_time)
+                brief = {
+                    "situation": "time_captured",
+                    "time": maybe_time,
+                    "fallback": "Got it, {time} works. Now, details: name, email, phone?"
+                }
+                reply = compose_reply_with_llm(user_id, brief, settings)
                 sess["history"].append({"role": "assistant", "content": reply})
                 session_store.set(user_id, sess)
                 return (reply, [])
@@ -1537,7 +1535,12 @@ def handle_message(user_id: str, message: str, settings: Optional[BotSettings] =
             return (resp, [])
         except Exception as e:
             dbg("handle_selection failed", str(e))
-            reply = f"{settings.prompts.selection_help} You have {len(sess.get('last_results') or [])} options."
+            brief = {
+                "situation": "selection_help",
+                "options_count": len(sess.get('last_results') or []),
+                "fallback": "Which ones catch your eye? Just say the numbers, like '1 and 3'."
+            }
+            reply = compose_reply_with_llm(user_id, brief, settings)
             sess["history"].append({"role": "assistant", "content": reply})
             session_store.set(user_id, sess)
             return (reply, [])
@@ -1547,7 +1550,12 @@ def handle_message(user_id: str, message: str, settings: Optional[BotSettings] =
     is_search_intent = (intent == "search") and (bool(query) or bool(areas))
 
     if intent == "clarify" or needs_clarify:
-        reply = settings.prompts.clarify
+        brief = {
+            "situation": "needs_clarify",
+            "prefs": sess.get("prefs", {}),
+            "fallback": "Help me narrow it down—what's the area/station? Max budget in JPY? Bedrooms? Hit me with details!"
+        }
+        reply = compose_reply_with_llm(user_id, brief, settings)
         sess["history"].append({"role": "assistant", "content": reply})
         session_store.set(user_id, sess)
         return (reply, [])
@@ -1556,13 +1564,14 @@ def handle_message(user_id: str, message: str, settings: Optional[BotSettings] =
         brief = {
             "user_message": message,
             "prefs": sess.get("prefs", {}),
-            "fallback": settings.prompts.fallback_reply
+            "situation": "off_search",
+            "fallback": "I'm all about finding you killer apartments—want me to scout some options?"
         }
         try:
             reply_text = compose_reply_with_llm(user_id, brief, settings)
         except Exception as e:
             dbg("compose_reply_with_llm failed", str(e))
-            reply_text = settings.prompts.fallback_reply
+            reply_text = brief["fallback"]
         sess["history"].append({"role": "assistant", "content": reply_text})
         session_store.set(user_id, sess)
         return (reply_text, [])
@@ -1574,26 +1583,51 @@ def handle_message(user_id: str, message: str, settings: Optional[BotSettings] =
     packed = search_and_clean(user_id, final_query, sess['prefs'], settings, min_count=3)
 
     if packed.get("unavailable"):
-        no_data_msg = settings.prompts.no_results
-        sess["history"].append({"role": "assistant", "content": no_data_msg})
+        reason = packed.get("reason", "no_results")
+        if reason == "non_japan":
+            brief = {
+                "situation": "non_japan",
+                "query": final_query,
+                "fallback": "Oops, right now I'm all about spots in Japan—apologies for the mix-up! Meant Chiba or somewhere local? Let's pivot there."
+            }
+        else:
+            brief = {
+                "situation": "no_results",
+                "query": final_query,
+                "prefs": sess['prefs'],
+                "fallback": "No luck on that exact search yet. Nearby hoods? Tweak budget or beds?"
+            }
+        reply = compose_reply_with_llm(user_id, brief, settings)
+        sess["history"].append({"role": "assistant", "content": reply})
         session_store.set(user_id, sess)
-        return (no_data_msg, [])
+        return (reply, [])
 
     results = packed["final"]
     sess['last_results'] = results
     session_store.set(user_id, sess)
 
     if len(results) == 0:
-        no_data_msg = settings.prompts.no_results
-        sess["history"].append({"role": "assistant", "content": no_data_msg})
+        brief = {
+            "situation": "no_results",
+            "query": final_query,
+            "prefs": sess['prefs'],
+            "fallback": "Dang, nothing popped up just yet. Refine the area or budget?"
+        }
+        reply = compose_reply_with_llm(user_id, brief, settings)
+        sess["history"].append({"role": "assistant", "content": reply})
         session_store.set(user_id, sess)
-        return (no_data_msg, [])
+        return (reply, [])
 
     listing_text = format_listings_for_user(results)
+    brief = {
+        "situation": "results",
+        "results_count": len(results),
+        "listings": listing_text,
+        "fallback": f"Found {len(results)} solid options! Pick numbers you dig (e.g., '1, 3').\n\n{listing_text}"
+    }
     if len(results) < 5:
-        reply = settings.prompts.short_results_prefix + listing_text
-    else:
-        reply = settings.prompts.results_prefix + listing_text
+        brief["fallback"] = f"Just a few gems based on what you've shared—more deets on station/budget/beds for better hits?\n\n{listing_text}"
+    reply = compose_reply_with_llm(user_id, brief, settings)
 
     sess["history"].append({"role": "assistant", "content": reply})
     session_store.set(user_id, sess)
@@ -1626,41 +1660,56 @@ def _looks_like_selection(s: str, list_len: int) -> bool:
     return got_any
 
 from urllib.parse import urlparse  # put at top of file
-
 def _extract_image_urls(item: Dict[str, Any]) -> List[str]:
     """Collect plausible image URLs; skip obvious UI icons/sprites."""
-    keys = ["image", "image_url", "image_urls", "images", "photos", "thumbnails"]
-    urls: List[str] = []
-    for k in keys:
-        v = item.get(k)
-        if not v:
-            continue
-        if isinstance(v, str):
-            urls.append(v)
-        elif isinstance(v, list):
-            urls.extend([x for x in v if isinstance(x, str)])
-
+    urls = []
+    
+    # Handle the 'images' field which is a string representation of a list
+    if "images" in item and isinstance(item["images"], str):
+        import ast
+        try:
+            # Try to safely evaluate the string as a Python literal
+            images_list = ast.literal_eval(item["images"])
+            if isinstance(images_list, list):
+                urls = [img for img in images_list if isinstance(img, str) and img.startswith(('http://', 'https://'))]
+                dbg("parsed_images_list", {
+                    "count": len(urls),
+                    "sample": urls[0][:100] + "..." if urls else "None"
+                })
+        except (ValueError, SyntaxError) as e:
+            # If evaluation fails, fall back to regex
+            import re
+            img_urls = re.findall(r'https?://[^\s\']+', item["images"])
+            if img_urls:
+                urls = img_urls
+                dbg("fallback_regex_extraction", {
+                    "count": len(urls),
+                    "sample": urls[0][:100] + "..." if urls else "None"
+                })
+    
+    # Clean and validate URLs
     out = []
     seen = set()
-    for u in urls:
-        if not isinstance(u, str):
+    for url in urls:
+        if not isinstance(url, str) or len(url) < 10:
             continue
-        if not u.startswith(("http://", "https://")):
+            
+        url = url.strip("'\"")
+        if not any(ext in url.lower() for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
             continue
+            
+        if url not in seen:
+            seen.add(url)
+            out.append(url)
+    
+    dbg("final_extracted_urls", {
+        "item_title": item.get("title") or item.get("name") or "unknown",
+        "found_urls": len(out),
+        "sample_urls": out[:3] if out else []
+    })
+    
+    return out
 
-        # Heuristics to skip UI sprites/icons
-        path = urlparse(u).path.lower()
-        if any(tok in path for tok in ["icon_", "/icons/", "sprite", "emoji", "placeholder"]):
-            continue
-        if path.endswith(".svg"):
-            continue
-
-        # If there's a typical image extension, good; otherwise still allow (Twilio only needs public URL)
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-
-    return out[:2]
 
 def _download_images_to_temp(urls: List[str]) -> Tuple[str, List[str]]:
     """
@@ -1886,7 +1935,8 @@ def _has_full_contact(msg: str) -> bool:
     has_phone = len(digits) >= 7
     name = _extract_name(msg)
     return bool(has_email and has_phone and name)
-
+import time  # For retriesimport time  # Ensure for backoff
+import time  # For backoff
 
 def send_listing_images_if_any(user_id: str, listing: Dict[str, Any]) -> None:
     tmpdir = tmpdir2 = None
@@ -1899,10 +1949,10 @@ def send_listing_images_if_any(user_id: str, listing: Dict[str, Any]) -> None:
         # Helper to force HTTPS
         def _https(u): 
             if u.startswith("https://"): return u
-            if u.startswith("http://"):  return "https://" + u.split("://",1)[1]
+            if u.startswith("http://"): return "https://" + u.split("://",1)[1]
             return u
 
-        # FAST PATH (optional): Send originals directly
+        # FAST PATH: Send originals directly (use if processing fails often)
         if os.getenv("SEND_ORIGINAL_IMAGE_URLS", "0").lower() in ("1","true","yes"):
             sess = ensure_session(user_id)
             to_number = (
@@ -1912,23 +1962,94 @@ def send_listing_images_if_any(user_id: str, listing: Dict[str, Any]) -> None:
             )
             if not to_number:
                 dbg("no_recipient_number", {"user_id": user_id}); return
-            fast_urls = [_https(u) for u in urls[:2]]
+            fast_urls = [_https(u) for u in urls[:int(os.getenv("MAX_MEDIA_PER_SEND","2"))]]
             dbg("media_urls_fastpath", fast_urls)
             _twilio_send_whatsapp_media(fast_urls, to_number)
             return
 
-        # Attempt download → process → caption
-        tmpdir, files = _download_images_to_temp(urls)
+        # Priority: Third-party proxy from env (e.g., BrightData URL for 99% success)
+        THIRD_PARTY_PROXY = os.getenv("IMAGE_PROXY_URL", None)  # Set to paid proxy like BrightData
+
+        # Expanded hardcoded list of fresh Japan elite proxies (20+ from latest Oct 2025 lists)
+        FREE_PROXY_LIST = [
+            "http://103.147.14.119:80",      # Tokyo, Elite HTTP
+            "http://103.147.14.120:80",      # Osaka, Elite HTTP
+            "http://116.80.58.222:3172",     # Japan General, Elite HTTP
+            "http://8.130.34.44:8080",       # Tokyo, Anonymous HTTP
+            "https://140.227.1.10:80",       # JP Residential-like, Elite HTTPS
+            "http://47.74.46.81:102",        # Tokyo Backup
+            "http://116.80.59.172:80",       # Japan Low Latency
+            "http://147.75.34.105:443",      # EU/JP Route, Elite HTTPS
+            "http://77.105.137.42:8080",     # EU Backup
+            "http://199.188.207.170:8080",   # US/JP Route
+            "http://15.168.235.57:407",      # JP Fresh Elite HTTP (new from free-proxy-list)
+            "http://47.79.93.202:1122",      # Tokyo Elite HTTP (new)
+            "http://160.251.142.232:80",     # Japan Elite HTTP (new)
+            "http://103.147.14.121:80",      # Osaka Backup
+            "http://116.80.58.223:3172",     # Japan General Backup
+            "http://8.130.34.45:8080",       # Tokyo Backup
+            "https://140.227.1.11:80",       # JP Residential Backup
+            "http://47.74.46.82:102",        # Tokyo Elite Backup
+            "http://116.80.59.173:80",       # Japan Low Latency Backup
+            "http://147.75.34.106:443",      # EU/JP Backup
+            "http://140.227.61.201:80",      # JP Elite (from ditatompel)
+            "http://15.168.235.58:407"       # JP Fresh Backup
+        ]
+
+        # Use third-party first, fallback to free list
+        PROXY_TO_TRY = [THIRD_PARTY_PROXY] if THIRD_PARTY_PROXY else FREE_PROXY_LIST
+
+        # Enhanced download with proxy rotation + retries + detailed logging
+        def _download_with_retry(urls_list: List[str], max_retries: int = 3) -> Tuple[Optional[str], List[str]]:
+            proxy_attempts = 0
+            for proxy in PROXY_TO_TRY:
+                if not proxy:
+                    continue
+                proxy_attempts += 1
+                is_third_party = proxy == THIRD_PARTY_PROXY
+                dbg("trying_proxy_rotation", {"proxy": proxy[:20] + "...", "is_third_party": is_third_party, "attempt": proxy_attempts})
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        sess = _session_with_retries()
+                        if proxy:
+                            sess.proxies = {"http": proxy, "https": proxy}
+
+                        # Yahoo-specific: Force referer/UA
+                        for u in urls_list:
+                            if "yimg.jp" in u:
+                                sess.headers.update({
+                                    "Referer": "https://realestate.yahoo.co.jp/",
+                                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                                })
+                                break
+
+                        tmp_d, files_d = _download_images_to_temp(urls_list)
+                        if files_d:
+                            dbg(f"download_success_proxy_{proxy[:20]}..._attempt_{attempt}", {"files": len(files_d), "urls": [u[:50] + "..." for u in urls_list], "is_third_party": is_third_party})
+                            return tmp_d, files_d
+                        else:
+                            dbg(f"download_failed_proxy_{proxy[:20]}..._attempt_{attempt}", {"reason": "no_files", "urls": [u[:50] + "..." for u in urls_list], "is_third_party": is_third_party})
+                            if attempt < max_retries:
+                                time.sleep(2 ** attempt)  # Exponential backoff
+                    except Exception as retry_e:
+                        dbg(f"download_retry_proxy_{proxy[:20]}..._attempt_{attempt}_error", {"error": str(retry_e), "urls": [u[:50] + "..." for u in urls_list], "is_third_party": is_third_party})
+                        if attempt == max_retries:
+                            continue  # Next proxy
+            dbg("all_proxies_failed_after_rotation", {"total_proxies_tried": len(PROXY_TO_TRY), "third_party_used": bool(THIRD_PARTY_PROXY)})
+            return None, []
+
+        # Attempt download with retries
+        tmpdir, files = _download_with_retry(urls)
         if not files:
             rehosted = _maybe_upload_from_urls(urls)
             if rehosted:
-                tmpdir2, files2 = _download_images_to_temp(rehosted)
+                tmpdir2, files2 = _download_with_retry(rehosted)
                 files = files2
 
         # If still no files, fallback to originals
         if not files:
-            dbg("image_download_unavailable_fallback_to_originals", {"original_urls": urls[:2]})
-            media_to_send = [_https(u) for u in urls[:2]]
+            dbg("image_download_unavailable_after_retries_fallback_to_originals", {"original_urls": [u[:50] + "..." for u in urls[:2]]})
+            media_to_send = [_https(u) for u in urls[:int(os.getenv("MAX_MEDIA_PER_SEND","2"))]]
         else:
             # Process files
             files = _lightly_process_images(files)
@@ -1936,17 +2057,17 @@ def send_listing_images_if_any(user_id: str, listing: Dict[str, Any]) -> None:
             cap = os.getenv("CAPTION_TEXT", "disruptive thoughts generation")
             files = [_add_caption_to_file(p, cap) for p in files]
 
-            # Publish processed files
+            # Publish
             media_to_send = _publish_locally(files)
             if not media_to_send:
                 dbg("local_publish_failed_all_fallback_to_originals", "FALLBACK_TO_ORIGINAL_URLS")
-                media_to_send = [_https(u) for u in urls[:2]]
+                media_to_send = [_https(u) for u in urls[:int(os.getenv("MAX_MEDIA_PER_SEND","2"))]]
 
-        dbg("media_urls_final", media_to_send)
+        dbg("media_urls_final", media_to_send[:2])  # First 2 for debug
 
-        # Optional probe (only for self-hosted; skip for originals/third-party)
+        # Probe only for self-hosted
         if (os.getenv("MEDIA_PROBE_BEFORE_SEND", "0").lower() in ("1","true","yes") and 
-            all(u.startswith(os.getenv("MEDIA_BASE_URL", "")) for u in media_to_send)):
+            all("static/wa-media" in u for u in media_to_send)):  # Adjust for your server
             _wait_until_public(media_to_send)
 
         sess = ensure_session(user_id)
@@ -1962,11 +2083,11 @@ def send_listing_images_if_any(user_id: str, listing: Dict[str, Any]) -> None:
 
     except Exception as e:
         dbg("send_listing_images_if_any_failed", str(e))
-        # Ultimate fallback: Send first original URL if possible
+        # Ultimate fallback: One original
         try:
-            urls = _extract_image_urls(listing)  # Re-extract if needed
+            urls = _extract_image_urls(listing)
             if urls:
-                fallback_urls = [_https(u) for u in urls[:2]]  # At least one
+                fallback_urls = [_https(urls[0])]
                 sess = ensure_session(user_id)
                 to_number = (
                     _normalize_wa_number(user_id)
@@ -1984,6 +2105,8 @@ def send_listing_images_if_any(user_id: str, listing: Dict[str, Any]) -> None:
         try: shutil.rmtree(tmpdir2, ignore_errors=True)
         except Exception: pass
 
+
+
 def handle_selection(user_id: str, message_or_selection, settings: Optional[BotSettings] = None) -> str:
     """
     Accepts either:
@@ -1996,7 +2119,11 @@ def handle_selection(user_id: str, message_or_selection, settings: Optional[BotS
     hits = sess.get('last_results') or []
     if not hits:
         dbg("Selection but no last_results", user_id)
-        return "I don't have any options stored yet. Ask me to search apartments first."
+        brief = {
+            "situation": "no_options_yet",
+            "fallback": "Haven't pulled options yet—tell me what you're after?"
+        }
+        return compose_reply_with_llm(user_id, brief, settings)
 
     dbg("handle_selection input", message_or_selection)
 
@@ -2007,7 +2134,12 @@ def handle_selection(user_id: str, message_or_selection, settings: Optional[BotS
             sess['appt_time'] = maybe_time
             sess['awaiting_contact'] = True
             session_store.set(user_id, sess)
-            return settings.prompts.thanks_time_saved.format(time=maybe_time)
+            brief = {
+                "situation": "time_captured",
+                "time": maybe_time,
+                "fallback": "Perfect, {time} sounds good. Name, email, phone to seal the deal?"
+            }
+            return compose_reply_with_llm(user_id, brief, settings)
 
     if isinstance(message_or_selection, (list, tuple)) and any(isinstance(n, int) for n in message_or_selection):
         nums_list = [int(n) for n in message_or_selection if isinstance(n, int)]
@@ -2041,7 +2173,12 @@ def handle_selection(user_id: str, message_or_selection, settings: Optional[BotS
 
     valid = sorted({n for n in nums_list if 1 <= n <= len(hits)})
     if not valid:
-        return f"{settings.prompts.selection_help} You have {len(hits)} options."
+        brief = {
+            "situation": "invalid_selection",
+            "options_count": len(hits),
+            "fallback": "Hmm, those numbers don't match up—try '1 and 3' or whatever grabs you from the list?"
+        }
+        return compose_reply_with_llm(user_id, brief, settings)
 
     idx = [n - 1 for n in valid]
     chosen = [hits[i] for i in idx]
@@ -2079,7 +2216,12 @@ def handle_selection(user_id: str, message_or_selection, settings: Optional[BotS
         summary_lines.append(line)
     summary = "\n\n".join(summary_lines)
 
-    reply = settings.prompts.selection_time_prompt.replace("{summary}", summary)
+    brief = {
+        "situation": "selection_confirmed",
+        "chosen_summary": summary,
+        "fallback": f"Love those picks!\n\n{summary}\n\nWhen's good for a look? (e.g., '10am tomorrow' or 'anytime this week')"
+    }
+    reply = compose_reply_with_llm(user_id, brief, settings)
     return reply
 
 
@@ -2214,7 +2356,11 @@ def handle_contact(user_id: str, message: str, settings: Optional[BotSettings] =
         session_store.set(user_id, sess)
         chosen = sess.get("chosen") or []
         if not chosen:
-            final_msg = reply + " If you'd like, I can continue searching or book a viewing."
+            brief = {
+                "situation": "contact_complete_no_choice",
+                "fallback": "All set with your info! Ready to hunt more or book something?"
+            }
+            final_msg = compose_reply_with_llm(user_id, brief, settings)
             try:
                 session_store.delete(user_id)
             except Exception:
@@ -2232,16 +2378,14 @@ def handle_contact(user_id: str, message: str, settings: Optional[BotSettings] =
         summary = "\n".join(summary_lines)
 
         time_str = sess.get("appt_time") or "TBD"
-        final_msg = (
-            reply + "\n\n" +
-            settings.prompts.final_confirmation.format(
-                summary=summary,
-                time=time_str,
-                name=contact.get("name"),
-                email=contact.get("email"),
-                phone=contact.get("phone")
-            )
-        )
+        brief = {
+            "situation": "booking_confirmed",
+            "summary": summary,
+            "time": time_str,
+            "contact": contact,
+            "fallback": f"Locked in! You're eyeing:\n{summary}\n\nTime: {time_str}\nYou: {contact['name']} | {contact['email']} | {contact['phone']}\n\nI'll hit you up soon—chat if plans shift!"
+        }
+        final_msg = compose_reply_with_llm(user_id, brief, settings)
         # After confirming, clear session per requirement
         try:
             session_store.delete(user_id)
