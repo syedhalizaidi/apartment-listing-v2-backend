@@ -832,13 +832,13 @@ def _search_once(store: ListingStore, variants: List[str]) -> List[Dict[str, Any
     for q in variants:
         dbg("Search query", q)
         # pass-through where filters later at caller; here focus on recall
-        cands = store.search(q, n=200) or []
+        cands = store.search(q, n=300) or []
         dbg("Candidates found", len(cands))
         for c in cands:
             key = c.get("id") or c.get("url") or c.get("details_url") or c.get("source") or c.get("document") or str(c)[:200]
             if key not in seen_ids:
                 seen_ids.add(key); all_candidates.append(c)
-        if len(all_candidates) >= 400:
+        if len(all_candidates) >= 600:
             break
     dbg("Merged candidates total", len(all_candidates))
     # deterministic ordering by score desc then id/url asc
@@ -948,7 +948,7 @@ def search_and_clean(user_id: str, query: str, prefs: Dict[str, Any], settings: 
     # use where filters to push down numeric filtering
     all_candidates = []
     for qv in variants:
-        cs = store.search(qv, n=200, where=prefs) or []  # Increased n for more results on corrections
+        cs = store.search(qv, n=300, where=prefs) or []  # Increased n for more results on corrections
         all_candidates.extend(cs)
     # dedup
     seen = set(); merged=[]
@@ -1013,8 +1013,8 @@ def search_and_clean(user_id: str, query: str, prefs: Dict[str, Any], settings: 
     filtered = filter_results(base_pool, prefs)
     dbg("Filtered count", len(filtered))
 
-    top_for_clean = filtered[:15] if filtered else base_pool[:15]  # Increased for more results
-    cleaned = clean_results_with_llm(user_id, " / ".join(variants[:2]), prefs, top_for_clean, settings)[:15]
+    top_for_clean = filtered[:30] if filtered else base_pool[:30]  # Increased for more results
+    cleaned = clean_results_with_llm(user_id, " / ".join(variants[:2]), prefs, top_for_clean, settings)[:30]
     # ✅ Backfill any missing image fields from the originals
     cleaned = _backfill_media_from_hits(cleaned, top_for_clean)
 
@@ -1022,8 +1022,8 @@ def search_and_clean(user_id: str, query: str, prefs: Dict[str, Any], settings: 
 
     results: List[Dict[str, Any]] = cleaned
 
-    # Aim for a deterministic target count: prefer filtered size up to 15; otherwise base_pool size up to 15
-    target_count = min(15, len(filtered) if filtered else len(base_pool))
+    # Aim for a deterministic target count: prefer filtered size up to 30; otherwise base_pool size up to 30
+    target_count = min(30, len(filtered) if filtered else len(base_pool))
 
     if len(results) < target_count:
         def keyf(x): return (x.get("id"), x.get("url"), x.get("details_url"), x.get("title"))
@@ -1036,7 +1036,7 @@ def search_and_clean(user_id: str, query: str, prefs: Dict[str, Any], settings: 
                 break
 
     if len(results) < target_count:
-        coerced = coerce_candidates_to_listings(base_pool, want=max(target_count, 15))
+        coerced = coerce_candidates_to_listings(base_pool, want=max(target_count, 30))
         def keyf2(x): return (x.get("id"), x.get("url"), x.get("details_url"), x.get("title"))
         have = {keyf2(x) for x in results}
         for it in coerced:
@@ -1050,7 +1050,7 @@ def search_and_clean(user_id: str, query: str, prefs: Dict[str, Any], settings: 
         "candidates": base_pool,
         "filtered": filtered,
         "cleaned": cleaned,
-        "final": results[:target_count] or results[:15],
+        "final": results[:target_count] or results[:30],
         "unavailable": False
     }
     # store in cache
@@ -1164,7 +1164,7 @@ def clean_results_with_llm(user_id: str, query: str, prefs: Dict[str, Any], hits
             "4) Remove nulls and unknowns rather than writing placeholders.\n"
             "5) Preserve any image fields if present under the provided keys; coerce single strings to arrays when sensible.\n"
             "6) If a human-readable summary exists in listing text, set 'description' to a clean, single-line summary (140–220 chars, no newlines, no URLs).\n"
-            "7) Return a JSON object with {\"results\": [ ... up to 15 cleaned items ... ]}."
+            "7) Return a JSON object with {\"results\": [ ... up to 30 cleaned items ... ]}."
         )
 
     }
@@ -1177,9 +1177,9 @@ def clean_results_with_llm(user_id: str, query: str, prefs: Dict[str, Any], hits
         history_window=settings.history_window
     )
 
-    out = hits[:15]
+    out = hits[:30]
     if isinstance(result, dict) and "results" in result and isinstance(result["results"], list):
-        out = result["results"][:15]
+        out = result["results"][:30]
     return out
 
 
@@ -1460,15 +1460,15 @@ def handle_message(user_id: str, message: str, settings: Optional[BotSettings] =
     # 3) Merge prefs (avoid polluting prefs on pure selection/time)
     if intent not in ("select", "time"):
         merged = merge_prefs(sess['prefs'], parse_prefs(message))
-        new_locs = extract_locations_from_text(message)
-        if new_locs:
-            merged["areas"] = new_locs
-            dbg("Areas overridden from latest message", new_locs)
+        # first merge LLM
         for k, v in (prefs_from_llm or {}).items():
             if v not in (None, [], "", {}):
-                if k == "areas" and new_locs:
-                    continue
                 merged[k] = v
+        # then extract locations, but only if no areas yet
+        new_locs = extract_locations_from_text(message)
+        if new_locs and not merged.get("areas"):
+            merged["areas"] = new_locs
+            dbg("Areas overridden from latest message", new_locs)
         sess['prefs'] = merged
         session_store.set(user_id, sess)
         dbg("Prefs merged", merged)
