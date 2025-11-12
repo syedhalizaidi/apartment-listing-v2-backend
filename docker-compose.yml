@@ -1,0 +1,38 @@
+services:
+  web:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+
+    env_file:
+      - .env
+    environment:
+      FLASK_ENV: production
+      CHROMA_DIR: /data/chroma
+      HF_HOME: /cache/hf             # ← single source of truth for caching
+      PYTHONUNBUFFERED: "1"
+      GUNICORN_CMD_ARGS: "--workers=2 --threads=4 --timeout=120 --graceful-timeout=30 --keep-alive=5"
+      MEDIA_LOCAL_DIR: /app/static/wa-media
+      SERVER_BASE_URL: https://apartmentapi.bottomcode.com
+      MEDIA_BASE_URL: https://apartmentapi.bottomcode.com/static/wa-media
+      MEDIA_TTL_SECONDS: "3600"
+      MEDIA_PROBE_BEFORE_SEND: "0"
+      USE_OPENAI_IMAGE_EDIT: "0"
+
+    volumes:
+      - ./data/chroma:/data/chroma   # persist vector DB
+      - ./cache/hf:/cache/hf         # persist model cache
+      - ./logs:/app/logs
+      - /home/ubuntu/apartment-listing/static:/app/static
+
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:5000/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+    command: >
+      gunicorn -k gthread -w 2 --threads 4 -b 0.0.0.0:5000 run:app
